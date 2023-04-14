@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	codereadytoolchainv1alpha1 "github.com/codeready-toolchain/api/api/v1alpha1"
 	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -39,6 +40,9 @@ var _ = Describe("Test DeploymentTargetClaimBinderController", func() {
 			Expect(err).To(BeNil())
 
 			err = appstudiosharedv1.AddToScheme(scheme)
+			Expect(err).To(BeNil())
+
+			err = codereadytoolchainv1alpha1.AddToScheme(scheme)
 			Expect(err).To(BeNil())
 
 			testNS := corev1.Namespace{
@@ -114,6 +118,43 @@ var _ = Describe("Test DeploymentTargetClaimBinderController", func() {
 				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(&dt), &dt)
 				Expect(err).To(BeNil())
 				Expect(dt.Status.Phase).To(Equal(appstudiosharedv1.DeploymentTargetPhase_Released))
+
+				//				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(&spacerequest), &spacerequest)
+				//				Expect(err).To(BeNil())
+				//				Expect(dt.Status.Phase).To(Equal(appstudiosharedv1.DeploymentTargetPhase_Released))
+			})
+
+			It("should handle the deletion of a bounded DeploymentTargetClaim", func() {
+				dt := getDeploymentTarget(func(dt *appstudiosharedv1.DeploymentTarget) {
+					dt.Status.Phase = appstudiosharedv1.DeploymentTargetPhase_Released
+					dt.Spec.ClaimRef = "test-dtc"
+				})
+				err := k8sClient.Create(ctx, &dt)
+				Expect(err).To(BeNil())
+
+				spacerequest := getSpaceRequest(func(spacerequest *codereadytoolchainv1alpha1.SpaceRequest) {
+					spacerequest.Labels = map[string]string{
+						deploymentTargetClaimLabel: "test-dtc",
+					}
+				})
+				err = k8sClient.Create(ctx, &spacerequest)
+				Expect(err).To(BeNil())
+
+				nextrequest := newRequest(dt.Namespace, dt.Name)
+				res, err := reconciler.Reconcile(ctx, nextrequest)
+				Expect(err).To(BeNil())
+				Expect(res).To(Equal(ctrl.Result{}))
+
+				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(&dt), &dt)
+				Expect(dt.GetDeletionTimestamp()).NotTo(BeNil())
+
+				nextrequest = newRequest(dt.Namespace, dt.Name)
+				res, err = reconciler.Reconcile(ctx, nextrequest)
+				Expect(err).To(BeNil())
+				Expect(res).To(Equal(ctrl.Result{}))
+
+				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(&dt), &dt)
+				Expect(apierr.IsNotFound(err)).To(BeTrue())
 			})
 
 			It("should handle the deletion of a bounded DeploymentTargetClaim with deleted DeploymentTarget", func() {
@@ -1040,4 +1081,39 @@ func getDeploymentTarget(ops ...func(dt *appstudiosharedv1.DeploymentTarget)) ap
 	}
 
 	return dt
+}
+
+func getSpaceRequest(ops ...func(spacerequest *codereadytoolchainv1alpha1.SpaceRequest)) codereadytoolchainv1alpha1.SpaceRequest {
+	spacerequest := codereadytoolchainv1alpha1.SpaceRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-spacerequest",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{},
+		},
+		Spec: codereadytoolchainv1alpha1.SpaceRequestSpec{
+			TierName:           "test-tiername",
+			TargetClusterRoles: []string{"test-role"},
+		},
+		Status: codereadytoolchainv1alpha1.SpaceRequestStatus{
+			TargetClusterURL: "https://api-url/test-api",
+			NamespaceAccess: []codereadytoolchainv1alpha1.NamespaceAccess{
+				{
+					Name:      "test-new-ns",
+					SecretRef: "test-secret",
+				},
+			},
+			Conditions: []codereadytoolchainv1alpha1.Condition{
+				{
+					Type:   "Ready",
+					Status: corev1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	for _, o := range ops {
+		o(&spacerequest)
+	}
+
+	return spacerequest
 }

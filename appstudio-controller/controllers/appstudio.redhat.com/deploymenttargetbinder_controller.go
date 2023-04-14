@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 
+	codereadytoolchainv1alpha1 "github.com/codeready-toolchain/api/api/v1alpha1"
 	"github.com/go-logr/logr"
 	applicationv1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -41,11 +43,22 @@ type DeploymentTargetClaimReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+const (
+	// deploymentTargetClaimLabel is the label indicating the DeploymentTargetClaim that's associated with the object
+	FinalizerDT         = "dt.appstudio.redhat.com/finalizer"
+	environmentTierName = "appstudio-env"
+	// deploymentTargetClaimLabel is the label indicating the DeploymentTargetClaim that's associated with the object
+	deploymentTargetClaimLabel = "appstudio.openshift.io/dtc"
+)
+
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargetclaims,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargetclaims/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargetclaims/finalizers,verbs=update
-//+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargets,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargets,verbs=get;list;watch;update;patch;delete
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargets/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=appstudio.redhat.com,resources=deploymenttargets/finalizers,verbs=update
+//+kubebuilder:rbac:groups=toolchain.dev.openshift.com,resources=spacerequest,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=toolchain.dev.openshift.com,resources=spacerequest/status,verbs=get;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -69,7 +82,61 @@ func (r *DeploymentTargetClaimReconciler) Reconcile(ctx context.Context, req ctr
 	if err := r.Client.Get(ctx, client.ObjectKeyFromObject(&dtc), &dtc); err != nil {
 		// Don't requeue if the requested object is not found/deleted.
 		if apierr.IsNotFound(err) {
-			return ctrl.Result{}, nil
+			// Get the DT specified by the user in the DTC
+			dt := applicationv1alpha1.DeploymentTarget{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      req.Name,
+					Namespace: req.Namespace,
+				},
+			}
+
+			if err := r.Client.Get(ctx, client.ObjectKeyFromObject(&dt), &dt); err != nil {
+				if apierr.IsNotFound(err) {
+					return ctrl.Result{}, nil
+				}
+			}
+			// Add the deletion finalizer if it is absent.
+			if addFinalizer(&dt, FinalizerDT) {
+				if err := r.Client.Update(ctx, &dt); err != nil {
+					return ctrl.Result{}, fmt.Errorf("failed to add finalizer %s to DeploymentTarget %s in namespace %s: %v", FinalizerDT, dt.Name, dt.Namespace, err)
+				}
+				log.Info("Added finalizer to DeploymentTarget", "finalizer", FinalizerDT)
+			}
+
+			// Handle deletion if the DT has a deletion timestamp set.
+			if dt.GetDeletionTimestamp() != nil {
+				var sr *codereadytoolchainv1alpha1.SpaceRequest
+				var err error
+				if sr, err = findMatchingSpaceRequestForDT(ctx, r.Client, &dt); err != nil {
+					dt.Status.Phase = applicationv1alpha1.DeploymentTargetPhase_Failed
+					return ctrl.Result{}, err
+				}
+				if sr != nil {
+					// delete SpaceRequest, need to add finalizer in SandboxProvisioner
+					err = r.Client.Delete(ctx, sr)
+					if err != nil {
+						dt.Status.Phase = applicationv1alpha1.DeploymentTargetPhase_Failed
+						return ctrl.Result{}, err
+					}
+					log.Info("SpaceRequest is deleted", "SpaceRequest.Name", sr.Name, "SpaceRequest.Namespace", sr.Namespace)
+				}
+
+				if removeFinalizer(&dt, FinalizerDT) {
+					if err := r.Client.Update(ctx, &dt); err != nil {
+						return ctrl.Result{}, fmt.Errorf("failed to remove finalizer %s from DeploymentTarget %s in namespace %s: %v", FinalizerDT, dt.Name, dt.Namespace, err)
+					}
+					log.Info("Removed finalizer from DeploymentTarget", "finalizer", FinalizerDT)
+				}
+				return ctrl.Result{}, nil
+			}
+
+			if dt.Status.Phase == applicationv1alpha1.DeploymentTargetPhase_Released {
+				log.Info("Handling a deleted DeploymentTarget")
+				if err := r.Client.Delete(ctx, &dt); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
 		}
 		return ctrl.Result{}, err
 	}
@@ -359,6 +426,50 @@ func handleDynamicDTCProvisioning(ctx context.Context, k8sClient client.Client, 
 
 	// set the DTC to Pending phase and wait for the Provisioner to create a DT
 	return updateDTCStatusPhase(ctx, k8sClient, dtc, applicationv1alpha1.DeploymentTargetClaimPhase_Pending, log)
+}
+
+// findMatchingSpaceRequestForDT tries to find a SpaceRequest that matches the given DT in a namespace.
+// The function will return only the SpaceRequest that matches the expected environment Tier name
+func findMatchingSpaceRequestForDT(ctx context.Context, k8sClient client.Client, dt *applicationv1alpha1.DeploymentTarget) (*codereadytoolchainv1alpha1.SpaceRequest, error) {
+
+	spaceRequestList := codereadytoolchainv1alpha1.SpaceRequestList{}
+
+	opts := []client.ListOption{
+		client.InNamespace(dt.Namespace),
+		client.MatchingLabels{
+			deploymentTargetClaimLabel: dt.Spec.ClaimRef,
+		},
+	}
+
+	if err := k8sClient.List(ctx, &spaceRequestList, opts...); err != nil {
+		return nil, err
+	}
+
+	if len(spaceRequestList.Items) > 0 {
+		var spaceRequest *codereadytoolchainv1alpha1.SpaceRequest
+		for i, s := range spaceRequestList.Items {
+			if s.Spec.TierName == environmentTierName {
+				spaceRequest = &spaceRequestList.Items[i]
+				break
+			}
+		}
+		return spaceRequest, nil
+	}
+
+	return nil, nil
+}
+
+// findMatchingDTCForDT tries to find a DTC that matches the given DT in a namespace.
+func findMatchingDTCForDT(ctx context.Context, k8sClient client.Client, dt applicationv1alpha1.DeploymentTarget) (*applicationv1alpha1.DeploymentTargetClaim, error) {
+	dtc := &applicationv1alpha1.DeploymentTargetClaim{}
+	err := k8sClient.Get(ctx, types.NamespacedName{
+		Namespace: dt.Namespace,
+		Name:      dt.Spec.ClaimRef,
+	}, dtc)
+	if err != nil {
+		return nil, err
+	}
+	return dtc, err
 }
 
 // findMatchingDTForDTC tries to find a DT that matches the given DTC in a namespace.
